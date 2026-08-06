@@ -1,0 +1,17 @@
+# === PyInstaller Build Output ===
+/dist/
+/build/
+*.spec
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# === Environment & Config ===
+.env
+venv/
+.venv/
