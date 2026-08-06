@@ -61,4 +61,10 @@ Build the GUI as a standalone executable with PyInstaller:
 pyinstaller --onefile --windowed --name=YtAudioGUI YtAudioGUI.py
 ```
 
+or
+
+```bash
+pyinstaller --onefile --windowed --name=YtAudioGUI --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." YtAudioGUI.py
+```
+
 The resulting binary includes all dependencies and runs on Windows, macOS, and Linux.

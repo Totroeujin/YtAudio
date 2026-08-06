@@ -15,3 +15,7 @@ build/
 .env
 venv/
 .venv/
+
+# === ffmpeg.exe and ffprobe.exe ===
+ffmpeg.exe
+ffprobe.exe
