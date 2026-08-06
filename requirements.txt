@@ -1,2 +1,5 @@
-wxpython>=4.0.0
+# Audio download engine (used by both CLI and GUI)
 yt-dlp>=2023.04.10
+
+# Cross-platform GUI framework (wxWidgets Python bindings)
+wxpython>=4.2.0

@@ -2,31 +2,64 @@ import wx
 import yt_dlp
 import threading
 from pathlib import Path
+import re
+
+# Strip ANSI escape codes (color/formatting from yt_dlp) that the status bar can't render
+# Handles both full form (\x1b[0m) and true-color form (\x1b[38;2;R;G;Bm)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _strip_ansi(text: str) -> str:
+    if not isinstance(text, str):
+        return text or ''
+    return _ANSI_RE.sub('', text)
+
 
 class DownloadProgress:
-    def __init__(self, frame):
-        self.frame = frame
-        self.prev_msg = ""
+    """Thread-safe download progress tracker.
+    
+    Stores status updates that are read by the main thread via OnUpdateUI.
+    This avoids calling wx functions from background threads.
+    """
+    def __init__(self):
+        self.message = ""
+        self.is_downloading = False
+        self.percent = 0  # 0..100 for wx.Gauge
 
     def __call__(self, d):
-        wx.CallAfter(self._update, d)
-
-    def _update(self, d):
         if d['status'] == 'downloading':
-            msg = f"[DOWNLOADING] {d.get('_percent_str', '')} - ETA {d.get('_eta_str', '')}"
-            if msg != self.prev_msg:
-                self.frame.status_bar.SetStatusText(msg, 0)
-                self.prev_msg = msg
+            pct_str = d.get('_percent_str', '')
+            eta_str = d.get('_eta_str', '')
+            self.message = f"Downloading: {pct_str} - ETA {eta_str}"
+            # Extract numeric percentage for the gauge (yt_dlp may give "10.50%")
+            if pct_str and '%' in pct_str:
+                try:
+                    self.percent = int(float(pct_str.split('%')[0].strip().replace(',', '').replace(' ', '')))
+                except ValueError:
+                    pass
+            self.is_downloading = True
         elif d['status'] == 'finished':
-            self.frame.status_bar.SetStatusText("Conversion complete!", 0)
+            self.message = "Conversion complete!"
+            self.percent = 100
+            self.is_downloading = False
         elif d['status'] == 'error':
-            self.frame.status_bar.SetStatusText(f"[ERROR] {d.get('msg', 'Unknown')}", 0)
+            self.message = f"Error: {d.get('msg', 'Unknown')}"
+            self.percent = 0
+            self.is_downloading = False
+
 
 class MainFrame(wx.Frame):
     def __init__(self, parent, title="YtAudio GUI"):
         super().__init__(parent, title=title)
         self.CreateStatusBar()
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+        # Threading lock & download guard
+        self._download_lock = threading.Lock()
+        self._is_downloading = False
+        
+        # Progress tracker for main-thread UI updates
+        self._progress = DownloadProgress()
 
         # Create controls
         self.url_input = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
@@ -36,6 +69,9 @@ class MainFrame(wx.Frame):
         self.playlist_checkbox = wx.CheckBox(self, label="Download as playlist")
         self.start_button = wx.Button(self, label="Download")
         self.paste_button = wx.Button(self, label="Paste")
+
+        # Progress bar (wx.Gauge) — initially at 0%
+        self.gauge = wx.Gauge(self, range=100, size=(250, 20))
 
         # Layout
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -58,6 +94,7 @@ class MainFrame(wx.Frame):
 
         sizer.Add(self.playlist_checkbox, 0, wx.ALL, 5)
         sizer.Add(self.start_button, 0, wx.ALL | wx.CENTER, 5)
+        sizer.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 5)
         self.SetSizer(sizer)
 
         # Initialize settings
@@ -67,6 +104,25 @@ class MainFrame(wx.Frame):
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.output_button.Bind(wx.EVT_BUTTON, self.on_browse)
         self.paste_button.Bind(wx.EVT_BUTTON, self.on_paste)
+        
+        # Periodic UI update for status bar (runs on main thread)
+        self.Bind(wx.EVT_IDLE, self.on_idle)
+
+    def on_idle(self, event):
+        """Read progress from background thread and update status bar & gauge safely."""
+        msg = self._progress.message
+        if msg:
+            # Strip ANSI escape codes (e.g. [0m, [32m) that yt_dlp injects for color
+            self.SetStatusText(_strip_ansi(msg))
+            # Reset message after showing once to avoid flickering
+            self._progress.message = ""
+        
+        # Update the gauge with current percentage
+        pct = self._progress.percent
+        if self._progress.is_downloading or pct > 0:
+            self.gauge.SetValue(pct)
+
+        event.Skip()
 
     def on_paste(self, event):
         if wx.TheClipboard.Open():
@@ -85,21 +141,31 @@ class MainFrame(wx.Frame):
         dialog.Destroy()
 
     def on_start(self, event):
-        url = self.url_input.GetValue().strip()
-        if not url:
-            wx.MessageBox("Please enter a YouTube URL", "Error", wx.OK)
-            return
+        # Guard against multiple simultaneous downloads
+        with self._download_lock:
+            if self._is_downloading:
+                wx.MessageBox("A download is already in progress!", "Warning", wx.OK | wx.ICON_WARNING)
+                return
+            
+            url = self.url_input.GetValue().strip()
+            if not url:
+                wx.MessageBox("Please enter a YouTube URL", "Error", wx.OK)
+                return
 
-        format = self.format_choice.GetString(self.format_choice.GetSelection())
+            # Mark as downloading before spawning thread
+            self._is_downloading = True
+            self.start_button.Enable(False)  # Disable button during download
+
+        format_name = self.format_choice.GetString(self.format_choice.GetSelection())
         output = self.output_path.GetValue().strip()
         playlist = self.playlist_checkbox.GetValue()
 
-        # Start download thread
-        self.download_thread = threading.Thread(
+        # Start download thread (daemon=True so it doesn't block app exit)
+        threading.Thread(
             target=self.download_audio,
-            args=(url, format, output, playlist)
-        )
-        self.download_thread.start()
+            args=(url, format_name, output, playlist),
+            daemon=True
+        ).start()
 
     def download_audio(self, url, fmt, output_folder, playlist):
         try:
@@ -114,14 +180,33 @@ class MainFrame(wx.Frame):
                         "preferredquality": "192",
                     }
                 ],
-                "progress_hooks": [DownloadProgress(self)],
+                "progress_hooks": [self._progress],
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            wx.MessageBox("Download completed successfully!", "Success", wx.OK)
+
+            wx.CallAfter(self._show_success, "Download completed successfully!")
         except Exception as e:
-            wx.MessageBox(f"Download failed: {str(e)}", "Error", wx.OK)
+            wx.CallAfter(self._show_error, f"Download failed: {str(e)}")
+        finally:
+            # Always re-enable button and reset state (on main thread)
+            wx.CallAfter(self._on_download_finished)
+
+    def _show_success(self, msg):
+        self.SetStatusText(msg)
+        wx.MessageBox(msg, "Success", wx.OK | wx.ICON_INFORMATION)
+
+    def _show_error(self, msg):
+        self.SetStatusText(msg)
+        wx.MessageBox(msg, "Error", wx.OK | wx.ICON_ERROR)
+
+    def _on_download_finished(self):
+        """Called on main thread when download finishes (success or error)."""
+        self._is_downloading = False
+        self._progress.percent = 0
+        self.gauge.SetValue(0)
+        self.start_button.Enable()
 
     def on_close(self, event):
         self.Destroy()
