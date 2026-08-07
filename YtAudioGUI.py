@@ -3,11 +3,16 @@ import yt_dlp
 import threading
 from pathlib import Path
 import re
+import os
+import sys
 
 # Strip ANSI escape codes (color/formatting from yt_dlp) that the status bar can't render
 # Handles both full form (\x1b[0m) and true-color form (\x1b[38;2;R;G;Bm)
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Safely prepend the path so local ffmpeg takes priority
+    os.environ["PATH"] = sys._MEIPASS + os.pathsep + os.environ.get("PATH", "")
 
 def _strip_ansi(text: str) -> str:
     if not isinstance(text, str):
