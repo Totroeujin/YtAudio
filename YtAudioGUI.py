@@ -172,6 +172,7 @@ class MainFrame(wx.Frame):
             ydl_opts = {
                 "outtmpl": f"{output_folder}/%(title)s.%(ext)s",
                 "format": "bestaudio/best",
+                "nocheckcertificate": True,
                 "noplaylist": not playlist,
                 "postprocessors": [
                     {
