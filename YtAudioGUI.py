@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import os
 import sys
+import shutil
 
 # Strip ANSI escape codes (color/formatting from yt_dlp) that the status bar can't render
 # Handles both full form (\x1b[0m) and true-color form (\x1b[38;2;R;G;Bm)
@@ -173,31 +174,46 @@ class MainFrame(wx.Frame):
         ).start()
 
     def download_audio(self, url, fmt, output_folder, playlist):
-        try:
-            ydl_opts = {
-                "outtmpl": f"{output_folder}/%(title)s.%(ext)s",
-                "format": "bestaudio/best",
-                "nocheckcertificate": True,
-                "noplaylist": not playlist,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": fmt,
-                        "preferredquality": "192",
-                    }
-                ],
-                "progress_hooks": [self._progress],
-            }
+        # Use a temp directory so intermediate files never leak into user's output folder
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="ytaudio_") as tmp_dir:
+            try:
+                ydl_opts = {
+                    "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
+                    "format": "bestaudio/best",
+                    "nocheckcertificate": True,
+                    "noplaylist": not playlist,
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": fmt,
+                            "preferredquality": "192",
+                        }
+                    ],
+                    "progress_hooks": [self._progress],
+                }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-            wx.CallAfter(self._show_success, "Download completed successfully!")
-        except Exception as e:
-            wx.CallAfter(self._show_error, f"Download failed: {str(e)}")
-        finally:
-            # Always re-enable button and reset state (on main thread)
-            wx.CallAfter(self._on_download_finished)
+                # After successful extraction, copy the final audio file(s) to output_folder
+                # Find all .mp3/.m4a/.opus files in the temp dir (excluding the meta .part files)
+                ext_pattern = f"*.{fmt}"
+                audio_files = list(Path(tmp_dir).glob(ext_pattern))
+                output_path = Path(output_folder)
+                output_path.mkdir(parents=True, exist_ok=True)
+
+                for audio_file in audio_files:
+                    dest = output_path / audio_file.name
+                    shutil.move(str(audio_file), str(dest))
+                    wx.CallAfter(self.SetStatusText, f"Saved to: {dest}")
+
+                wx.CallAfter(self._show_success, "Download completed successfully!")
+            except Exception as e:
+                wx.CallAfter(self._show_error, f"Download failed: {str(e)}")
+            finally:
+                # Always re-enable button and reset state (on main thread)
+                wx.CallAfter(self._on_download_finished)
 
     def _show_success(self, msg):
         self.SetStatusText(msg)
