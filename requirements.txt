@@ -3,3 +3,5 @@ yt-dlp>=2023.04.10
 
 # Cross-platform GUI framework (wxWidgets Python bindings)
 wxpython>=4.2.0
+
+ytdlp-jsc>=0.1.7

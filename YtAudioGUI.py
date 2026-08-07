@@ -1,5 +1,9 @@
 import wx
 import yt_dlp
+try:
+    import ytdlp_jsc  # noqa: F401
+except ImportError:
+    ytdlp_jsc = None
 import threading
 from pathlib import Path
 import re
@@ -69,7 +73,8 @@ class MainFrame(wx.Frame):
 
         # Create controls
         self.url_input = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
-        self.format_choice = wx.Choice(self, choices=["mp3", "m4a", "opus"])
+        self.format_choice = wx.Choice(self, choices=["mp3", "m4a", "opus", "mp4"])
+        self.resolution_choice = wx.Choice(self, choices=["best", "720p", "1080p", "1440p", "2160p"])
         self.output_path = wx.TextCtrl(self)
         self.output_button = wx.Button(self, label="Browse")
         self.playlist_checkbox = wx.CheckBox(self, label="Download as playlist")
@@ -90,6 +95,8 @@ class MainFrame(wx.Frame):
         format_sizer = wx.BoxSizer(wx.HORIZONTAL)
         format_sizer.Add(wx.StaticText(self, label="Format:"), 0, wx.ALL, 5)
         format_sizer.Add(self.format_choice, 0, wx.ALL, 5)
+        format_sizer.Add(wx.StaticText(self, label="Resolution:"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        format_sizer.Add(self.resolution_choice, 0, wx.ALL, 5)
         sizer.Add(format_sizer, 0, wx.EXPAND)
 
         output_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -106,10 +113,13 @@ class MainFrame(wx.Frame):
         # Initialize settings
         self.url_input.Bind(wx.EVT_TEXT_ENTER, self.on_start)
         self.format_choice.SetSelection(0)
+        self.resolution_choice.SetSelection(0)
+        self.resolution_choice.Enable(False)
         self.output_path.SetValue(str(Path.home() / "downloads"))
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         self.output_button.Bind(wx.EVT_BUTTON, self.on_browse)
         self.paste_button.Bind(wx.EVT_BUTTON, self.on_paste)
+        self.format_choice.Bind(wx.EVT_CHOICE, self.on_format_change)
         
         # Periodic UI update for status bar (runs on main thread)
         self.Bind(wx.EVT_IDLE, self.on_idle)
@@ -140,6 +150,10 @@ class MainFrame(wx.Frame):
         else:
             wx.MessageBox("Could not access clipboard", "Error", wx.OK)
 
+    def on_format_change(self, event):
+        fmt = self.format_choice.GetString(self.format_choice.GetSelection())
+        self.resolution_choice.Enable(fmt == "mp4")
+
     def on_browse(self, event):
         dialog = wx.DirDialog(self, "Choose output folder", style=wx.DD_DIR_MUST_EXIST)
         if dialog.ShowModal() == wx.ID_OK:
@@ -163,49 +177,60 @@ class MainFrame(wx.Frame):
             self.start_button.Enable(False)  # Disable button during download
 
         format_name = self.format_choice.GetString(self.format_choice.GetSelection())
+        resolution = self.resolution_choice.GetString(self.resolution_choice.GetSelection())
         output = self.output_path.GetValue().strip()
         playlist = self.playlist_checkbox.GetValue()
 
         # Start download thread (daemon=True so it doesn't block app exit)
         threading.Thread(
             target=self.download_audio,
-            args=(url, format_name, output, playlist),
+            args=(url, format_name, output, playlist, resolution),
             daemon=True
         ).start()
 
-    def download_audio(self, url, fmt, output_folder, playlist):
+    def download_audio(self, url, fmt, output_folder, playlist, resolution):
         # Use a temp directory so intermediate files never leak into user's output folder
         import tempfile
         with tempfile.TemporaryDirectory(prefix="ytaudio_") as tmp_dir:
             try:
-                ydl_opts = {
-                    "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
-                    "format": "bestaudio/best",
-                    "nocheckcertificate": True,
-                    "noplaylist": not playlist,
-                    "postprocessors": [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": fmt,
-                            "preferredquality": "192",
-                        }
-                    ],
-                    "progress_hooks": [self._progress],
-                }
+                if fmt == "mp4":
+                    format_selector = self._build_video_format(resolution)
+                    ydl_opts = {
+                        "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
+                        "format": format_selector,
+                        "merge_output_format": "mp4",
+                        "nocheckcertificate": True,
+                        "noplaylist": not playlist,
+                        "progress_hooks": [self._progress],
+                    }
+                else:
+                    ydl_opts = {
+                        "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
+                        "format": "bestaudio/best",
+                        "nocheckcertificate": True,
+                        "noplaylist": not playlist,
+                        "postprocessors": [
+                            {
+                                "key": "FFmpegExtractAudio",
+                                "preferredcodec": fmt,
+                                "preferredquality": "192",
+                            }
+                        ],
+                        "progress_hooks": [self._progress],
+                    }
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
-                # After successful extraction, copy the final audio file(s) to output_folder
-                # Find all .mp3/.m4a/.opus files in the temp dir (excluding the meta .part files)
-                ext_pattern = f"*.{fmt}"
-                audio_files = list(Path(tmp_dir).glob(ext_pattern))
+                # After successful extraction, copy the final file(s) to output_folder
+                ext_pattern = "*.mp4" if fmt == "mp4" else f"*.{fmt}"
+                downloaded_files = list(Path(tmp_dir).glob(ext_pattern))
                 output_path = Path(output_folder)
                 output_path.mkdir(parents=True, exist_ok=True)
 
-                for audio_file in audio_files:
-                    dest = output_path / audio_file.name
-                    shutil.move(str(audio_file), str(dest))
+                for downloaded_file in downloaded_files:
+                    dest = output_path / downloaded_file.name
+                    shutil.move(str(downloaded_file), str(dest))
                     wx.CallAfter(self.SetStatusText, f"Saved to: {dest}")
 
                 wx.CallAfter(self._show_success, "Download completed successfully!")
@@ -214,6 +239,22 @@ class MainFrame(wx.Frame):
             finally:
                 # Always re-enable button and reset state (on main thread)
                 wx.CallAfter(self._on_download_finished)
+
+    def _build_video_format(self, resolution):
+        if resolution == "best":
+            return "bestvideo+bestaudio/best"
+
+        height_map = {
+            "720p": 720,
+            "1080p": 1080,
+            "1440p": 1440,
+            "2160p": 2160,
+        }
+        max_height = height_map.get(resolution, None)
+        if max_height is None:
+            return "bestvideo+bestaudio/best"
+
+        return f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
 
     def _show_success(self, msg):
         self.SetStatusText(msg)
