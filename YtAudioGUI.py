@@ -10,6 +10,7 @@ import re
 import os
 import sys
 import shutil
+import tempfile
 
 # Strip ANSI escape codes (color/formatting from yt_dlp) that the status bar can't render
 # Handles both full form (\x1b[0m) and true-color form (\x1b[38;2;R;G;Bm)
@@ -23,6 +24,60 @@ def _strip_ansi(text: str) -> str:
     if not isinstance(text, str):
         return text or ''
     return _ANSI_RE.sub('', text)
+
+
+def _process_is_running(process_id: int) -> bool:
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _move_without_overwrite(source: Path, output_folder: Path) -> Path:
+    destination = output_folder / source.name
+    suffix = 1
+    while destination.exists():
+        destination = output_folder / f"{source.stem} (recovered {suffix}){source.suffix}"
+        suffix += 1
+    return Path(shutil.move(str(source), str(destination)))
+
+
+def _cleanup_stale_temp_dirs(output_folder: str) -> tuple[int, int]:
+    output_path = Path(output_folder)
+    cleaned_folders = 0
+    recovered_files = 0
+    media_extensions = {".mp3", ".m4a", ".opus", ".mp4", ".webm", ".mkv", ".m4v", ".mov", ".avi", ".flv"}
+
+    for temp_dir in Path(tempfile.gettempdir()).glob("ytaudio_*"):
+        if not temp_dir.is_dir():
+            continue
+
+        owner_file = temp_dir / ".ytaudio_owner"
+        if owner_file.is_file():
+            try:
+                process_id = int(owner_file.read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                process_id = None
+            if process_id is not None and _process_is_running(process_id):
+                continue
+
+        media_files = [
+            path for path in temp_dir.iterdir()
+            if path.is_file() and not path.is_symlink() and path.suffix.lower() in media_extensions
+        ]
+        if media_files:
+            output_path.mkdir(parents=True, exist_ok=True)
+            for media_file in media_files:
+                _move_without_overwrite(media_file, output_path)
+                recovered_files += 1
+
+        shutil.rmtree(temp_dir)
+        cleaned_folders += 1
+
+    return cleaned_folders, recovered_files
 
 
 class DownloadProgress:
@@ -78,6 +133,8 @@ class MainFrame(wx.Frame):
         self.output_path = wx.TextCtrl(self)
         self.output_button = wx.Button(self, label="Browse")
         self.playlist_checkbox = wx.CheckBox(self, label="Download as playlist")
+        self.playlist_limit = wx.SpinCtrl(self, min=1, max=1000, initial=50, size=(80, -1))
+        self.playlist_limit.Enable(False)
         self.start_button = wx.Button(self, label="Download")
         self.paste_button = wx.Button(self, label="Paste")
 
@@ -105,7 +162,11 @@ class MainFrame(wx.Frame):
         output_sizer.Add(self.output_button, 0, wx.ALL, 5)
         sizer.Add(output_sizer, 0, wx.EXPAND)
 
-        sizer.Add(self.playlist_checkbox, 0, wx.ALL, 5)
+        playlist_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        playlist_sizer.Add(self.playlist_checkbox, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        playlist_sizer.Add(wx.StaticText(self, label="Max items:"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        playlist_sizer.Add(self.playlist_limit, 0, wx.ALL, 5)
+        sizer.Add(playlist_sizer, 0, wx.EXPAND)
         sizer.Add(self.start_button, 0, wx.ALL | wx.CENTER, 5)
         sizer.Add(self.gauge, 0, wx.EXPAND | wx.ALL, 5)
         self.SetSizer(sizer)
@@ -120,6 +181,7 @@ class MainFrame(wx.Frame):
         self.output_button.Bind(wx.EVT_BUTTON, self.on_browse)
         self.paste_button.Bind(wx.EVT_BUTTON, self.on_paste)
         self.format_choice.Bind(wx.EVT_CHOICE, self.on_format_change)
+        self.playlist_checkbox.Bind(wx.EVT_CHECKBOX, self.on_playlist_change)
         
         # Periodic UI update for status bar (runs on main thread)
         self.Bind(wx.EVT_IDLE, self.on_idle)
@@ -154,6 +216,9 @@ class MainFrame(wx.Frame):
         fmt = self.format_choice.GetString(self.format_choice.GetSelection())
         self.resolution_choice.Enable(fmt == "mp4")
 
+    def on_playlist_change(self, event):
+        self.playlist_limit.Enable(self.playlist_checkbox.GetValue())
+
     def on_browse(self, event):
         dialog = wx.DirDialog(self, "Choose output folder", style=wx.DD_DIR_MUST_EXIST)
         if dialog.ShowModal() == wx.ID_OK:
@@ -180,65 +245,98 @@ class MainFrame(wx.Frame):
         resolution = self.resolution_choice.GetString(self.resolution_choice.GetSelection())
         output = self.output_path.GetValue().strip()
         playlist = self.playlist_checkbox.GetValue()
+        max_items = self.playlist_limit.GetValue()
 
         # Start download thread (daemon=True so it doesn't block app exit)
         threading.Thread(
             target=self.download_audio,
-            args=(url, format_name, output, playlist, resolution),
+            args=(url, format_name, output, playlist, resolution, max_items),
             daemon=True
         ).start()
 
-    def download_audio(self, url, fmt, output_folder, playlist, resolution):
+    def download_audio(self, url, fmt, output_folder, playlist, resolution, max_items):
         # Use a temp directory so intermediate files never leak into user's output folder
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="ytaudio_") as tmp_dir:
-            try:
-                if fmt == "mp4":
-                    format_selector = self._build_video_format(resolution)
-                    ydl_opts = {
-                        "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
-                        "format": format_selector,
-                        "merge_output_format": "mp4",
-                        "nocheckcertificate": True,
-                        "noplaylist": not playlist,
-                        "progress_hooks": [self._progress],
-                    }
-                else:
-                    ydl_opts = {
-                        "outtmpl": f"{tmp_dir}/%(title)s.%(ext)s",
-                        "format": "bestaudio/best",
-                        "nocheckcertificate": True,
-                        "noplaylist": not playlist,
-                        "postprocessors": [
-                            {
-                                "key": "FFmpegExtractAudio",
-                                "preferredcodec": fmt,
-                                "preferredquality": "192",
-                            }
-                        ],
-                        "progress_hooks": [self._progress],
-                    }
+        completed_files = []
+        download_error = None
+        try:
+            cleaned_folders, recovered_files = _cleanup_stale_temp_dirs(output_folder)
+            if cleaned_folders:
+                wx.CallAfter(
+                    self.SetStatusText,
+                    f"Cleaned {cleaned_folders} old temp folder(s); recovered {recovered_files} media file(s).",
+                )
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
+            with tempfile.TemporaryDirectory(prefix="ytaudio_") as tmp_dir:
+                (Path(tmp_dir) / ".ytaudio_owner").write_text(str(os.getpid()), encoding="ascii")
+                try:
+                    if fmt == "mp4":
+                        format_selector = self._build_video_format(resolution)
+                        ydl_opts = {
+                            "outtmpl": f"{tmp_dir}/%(title)s [%(id)s].%(ext)s",
+                            "format": format_selector,
+                            "merge_output_format": "mp4",
+                            "remuxvideo": "mp4",
+                            "nocheckcertificate": True,
+                            "noplaylist": not playlist,
+                            "progress_hooks": [self._progress],
+                        }
+                    else:
+                        ydl_opts = {
+                            "outtmpl": f"{tmp_dir}/%(title)s [%(id)s].%(ext)s",
+                            "format": "bestaudio/best",
+                            "nocheckcertificate": True,
+                            "noplaylist": not playlist,
+                            "postprocessors": [
+                                {
+                                    "key": "FFmpegExtractAudio",
+                                    "preferredcodec": fmt,
+                                    "preferredquality": "192",
+                                }
+                            ],
+                            "progress_hooks": [self._progress],
+                        }
 
-                # After successful extraction, copy the final file(s) to output_folder
-                ext_pattern = "*.mp4" if fmt == "mp4" else f"*.{fmt}"
-                downloaded_files = list(Path(tmp_dir).glob(ext_pattern))
-                output_path = Path(output_folder)
-                output_path.mkdir(parents=True, exist_ok=True)
+                    if playlist:
+                        ydl_opts["playlistend"] = max_items
 
-                for downloaded_file in downloaded_files:
-                    dest = output_path / downloaded_file.name
-                    shutil.move(str(downloaded_file), str(dest))
-                    wx.CallAfter(self.SetStatusText, f"Saved to: {dest}")
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return_code = ydl.download([url])
+                        if return_code:
+                            download_error = RuntimeError(
+                                f"yt-dlp reported download errors (code {return_code})"
+                            )
+                except Exception as e:
+                    download_error = e
 
-                wx.CallAfter(self._show_success, "Download completed successfully!")
-            except Exception as e:
-                wx.CallAfter(self._show_error, f"Download failed: {str(e)}")
-            finally:
-                # Always re-enable button and reset state (on main thread)
-                wx.CallAfter(self._on_download_finished)
+                try:
+                    ext_pattern = "*.mp4" if fmt == "mp4" else f"*.{fmt}"
+                    downloaded_files = list(Path(tmp_dir).glob(ext_pattern))
+                    output_path = Path(output_folder)
+                    output_path.mkdir(parents=True, exist_ok=True)
+
+                    for downloaded_file in downloaded_files:
+                        dest = output_path / downloaded_file.name
+                        shutil.move(str(downloaded_file), str(dest))
+                        completed_files.append(dest)
+                        wx.CallAfter(self.SetStatusText, f"Saved to: {dest}")
+                except Exception as e:
+                    if download_error is None:
+                        download_error = e
+
+            if download_error:
+                message = f"Download failed: {download_error}"
+                if completed_files:
+                    message += f" ({len(completed_files)} completed file(s) were saved)"
+                wx.CallAfter(self._show_error, message)
+            elif not completed_files:
+                wx.CallAfter(self._show_error, "Download finished, but no output files were found.")
+            else:
+                wx.CallAfter(self._show_success, f"Download completed: {len(completed_files)} file(s) saved.")
+        except Exception as e:
+            wx.CallAfter(self._show_error, f"Download failed: {str(e)}")
+        finally:
+            # Always re-enable button and reset state (on main thread)
+            wx.CallAfter(self._on_download_finished)
 
     def _build_video_format(self, resolution):
         if resolution == "best":

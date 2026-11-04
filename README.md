@@ -8,8 +8,9 @@ Download YouTube audio offline with a simple GUI interface.
 - Choose audio format (MP3/M4A/OPUS) or download video as MP4
 - Select MP4 resolution (best / 720p / 1080p / 1440p / 2160p)
 - Select output folder
-- Playlist mode support
+- Playlist mode support with a configurable item limit (default: 50)
 - Download progress bar
+- Recover completed downloads from abandoned temporary folders before a new download
 
 ## Installation
 
@@ -19,14 +20,13 @@ pip install -r requirements.txt
 
 ### System Dependencies
 
-You must have **[ffmpeg](https://ffmpeg.org/)** installed on your system. yt-dlp relies on it for audio extraction, conversion, and MP4 merging.
+FFmpeg is required for audio conversion and video merging. The GUI uses `ffmpeg.exe` and `ffprobe.exe` when they are bundled with the Windows executable; when running from Python, install FFmpeg and make both tools available on `PATH`.
 
-You should also install **ytdlp-jsc** for the best YouTube format compatibility and to support newer streaming protections.
+YouTube extraction also requires a supported JavaScript runtime. `requirements.txt` installs yt-dlp with its default dependencies, including the EJS challenge scripts. Install [Deno](https://docs.deno.com/runtime/getting_started/installation/) and make it available on `PATH`; yt-dlp recommends Deno. The project also installs `ytdlp-jsc`, but it does not replace the runtime requirement.
 
 - **Windows:** `winget install ffmpeg` or download from https://www.gyan.dev/ffmpeg/builds/
 - **macOS:** `brew install ffmpeg`
 - **Linux:** `sudo apt install ffmpeg` (Debian/Ubuntu) or equivalent for your distro
-- Install solver support: `pip install ytdlp-jsc`
 
 ## Usage
 
@@ -35,6 +35,8 @@ You should also install **ytdlp-jsc** for the best YouTube format compatibility 
 ```bash
 python YtAudioGUI.py
 ```
+
+Check **Download as playlist** to download a playlist. The **Max items** control limits that GUI download (default: 50, range: 1–1000). If a previous run was interrupted, the next download recovers completed media files from old YtAudio temporary folders into the selected output folder and removes leftover temporary files.
 
 ### Command-Line Interface
 
@@ -59,16 +61,16 @@ python YtAudio.py "https://youtube.com/playlist?list=PLAYLIST_ID" --playlist
 
 ## Build Executable
 
-Build the GUI as a standalone executable with PyInstaller:
+Build the Windows executable from a Windows machine, using the same Python environment where the project requirements are installed. Install PyInstaller first:
 
-```bash
-pyinstaller --onefile --windowed --name=YtAudioGUI --hidden-import=ytdlp_jsc --add-binary "ffmpeg.exe;." YtAudioGUI.py
+```powershell
+python -m pip install pyinstaller
 ```
 
-or
+Place `ffmpeg.exe` and `ffprobe.exe` in the project directory, then run:
 
-```bash
-pyinstaller --onefile --windowed --name=YtAudioGUI --hidden-import=ytdlp_jsc --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." YtAudioGUI.py
+```powershell
+python -m PyInstaller --clean --onefile --windowed --name YtAudioGUI --hidden-import=ytdlp_jsc --collect-all yt_dlp_ejs --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." YtAudioGUI.py
 ```
 
-The resulting binary includes all dependencies and runs on Windows, macOS, and Linux.
+The executable is created at `dist\YtAudioGUI.exe`. This command bundles FFmpeg and yt-dlp's EJS scripts, but does not bundle Deno; install Deno on each target computer and make it available on `PATH`. PyInstaller builds are platform-specific, so create separate builds on Windows, macOS, and Linux with the appropriate FFmpeg binaries for each platform.
